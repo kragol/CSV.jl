@@ -232,14 +232,15 @@ function File(source;
     refs = Vector{RefPool}(undef, ncols)
     if threaded === true
         # multithread
-        finalrows, tapes = multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow - 1, pool, refs, ncols, typemap, h.categorical, customtypes, limit, filter, debug)
+        finalrows, tapes = multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow - 1, pool, refs, ncols, typemap, h.categorical, customtypes, limit, filter, h.names, debug)
     else
         if limit < rowsguess
             rowsguess = limit
         end
         tapes = allocate(rowsguess, ncols, types, flags)
+        codes = filter === nothing ? EMPTY_CODES : zeros(Int16, ncols)
         t = Base.time()
-        finalrows, pos = parsetape!(Val(transpose), ncols, typemap, tapes, buf, datapos, len, limit, positions, pool, refs, rowsguess, datarow - 1, types, flags, filter, debug, options, coloptions, customtypes)
+        finalrows, pos = parsetape!(Val(transpose), ncols, typemap, tapes, buf, datapos, len, limit, positions, pool, refs, rowsguess, datarow - 1, types, flags, filter, h.names, codes, debug, options, coloptions, customtypes)
         debug && println("time for initial parsing to tape: $(Base.time() - t)")
         for i = 1:ncols
             tape = tapes[i]
@@ -282,6 +283,7 @@ end
 
 const EMPTY_INT_ARRAY = Int64[]
 const EMPTY_REFRECODE = UInt32[]
+const EMPTY_CODES = Int16[]
 
 function syncrefs!(refs, tl_refs, col, tl_rows, tape)
     if !isassigned(refs, col)
@@ -375,9 +377,9 @@ function promotetostring!(tapes, poslens, flags, col, rows, fullrows, options, b
     return
 end
 
-function multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow, pool, refs, ncols, typemap, categorical, customtypes, limit, filter, debug)
+function multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow, pool, refs, ncols, typemap, categorical, customtypes, limit, filter, names, debug)
     N = Threads.nthreads()
-    if limit < rowsguess
+    if limit < rowsguess && filter === nothing
         newlen = [0, ceil(Int64, (limit / (rowsguess * 0.8)) * len), 0]
         findrowstarts!(buf, len, options, newlen, ncols)
         len = newlen[2]
@@ -402,7 +404,8 @@ function multithreadparse(types, flags, buf, datapos, len, options, coloptions, 
         tl_types = copy(types)
         tl_tapes = allocate(rowchunkguess, ncols, tl_types, tl_flags)
         perthreadtapes[i] = tl_tapes
-        tl_rows, tl_pos = parsetape!(Val(false), ncols, typemap, tl_tapes, buf, tl_pos, tl_len, typemax(Int64), EMPTY_INT_ARRAY, pool, tl_refs, rowchunkguess, datarow + (rowchunkguess * (i - 1)), tl_types, tl_flags, filter, debug, options, coloptions, customtypes)
+        codes = filter === nothing ? EMPTY_CODES : zeros(Int16, ncols)
+        tl_rows, tl_pos = parsetape!(Val(false), ncols, typemap, tl_tapes, buf, tl_pos, tl_len, typemax(Int64), EMPTY_INT_ARRAY, pool, tl_refs, rowchunkguess, datarow + (rowchunkguess * (i - 1)), tl_types, tl_flags, filter, names, codes, debug, options, coloptions, customtypes)
         rows[i] = tl_rows
         # promote column types across threads
         for col = 1:ncols
@@ -489,13 +492,13 @@ function multithreadparse(types, flags, buf, datapos, len, options, coloptions, 
     return limit < finalrows ? limit : finalrows, finaltapes
 end
 
-function parsetape!(TR::Val{transpose}, ncols, typemap, tapes, buf, pos, len, limit, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
+function parsetape!(TR::Val{transpose}, ncols, typemap, tapes, buf, pos, len, limit, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, names, codes, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
     row = 0
     startpos = pos
     if pos <= len && len > 0
         while row < limit
             row += 1
-            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, debug, options, coloptions, customtypes)
+            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, names, codes, debug, options, coloptions, customtypes)
             (pos > len || row == limit) && break
             # if our initial row estimate was too few, we need to reallocate our tapes/poslens to read the rest of the file
             if row + 1 > rowsguess
@@ -534,7 +537,7 @@ end
     if pos <= len && len > 0
         while row < limit
             row += 1
-            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, nothing, debug, options, coloptions, customtypes)
+            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, nothing, Symbol[], Int16[], debug, options, coloptions, customtypes)
             pos > len && break
         end
     end
@@ -575,9 +578,9 @@ end
     end
 end
 
-@inline function parserow(row, TR::Val{transpose}, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
+@inline function parserow(row, TR::Val{transpose}, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, names, codes, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
     while pos <= len
-        startpos = pos
+        rowstart = pos
         rowcode = None
         for col = 1:ncols
             if transpose
@@ -633,30 +636,31 @@ end
                         end
                         break # from for col = 1:ncols
                     end
-            else
-                if col < ncols
-                    if Parsers.newline(code) || pos > len
-                        rowcode = NotEnoughColumns
-                        options.silencewarnings || notenoughcolumns(col, ncols, rowoffset + row)
-                        for j = (col + 1):ncols
-                            @inbounds flags[j] |= ANYMISSING
-                            @inbounds types[j] = Union{Missing, types[j]}
-                        end
-                        break # from for col = 1:ncols
-                    end
                 else
-                    if pos <= len && !Parsers.newline(code)
-                        rowcode = TooManyColumns
-                        options.silencewarnings || toomanycolumns(ncols, rowoffset + row)
-                        # ignore the rest of the line
-                        pos = skiptorow(buf, pos, len, options.oq, options.e, options.cq, 1, 2)
+                    if col < ncols
+                        if Parsers.newline(code) || pos > len
+                            rowcode = NotEnoughColumns
+                            options.silencewarnings || notenoughcolumns(col, ncols, rowoffset + row)
+                            for j = (col + 1):ncols
+                                @inbounds flags[j] |= ANYMISSING
+                                @inbounds types[j] = Union{Missing, types[j]}
+                            end
+                            break # from for col = 1:ncols
+                        end
+                    else
+                        if pos <= len && !Parsers.newline(code)
+                            rowcode = TooManyColumns
+                            options.silencewarnings || toomanycolumns(ncols, rowoffset + row)
+                            # ignore the rest of the line
+                            pos = skiptorow(buf, pos, len, options.oq, options.e, options.cq, 1, 2)
+                        end
                     end
                 end
             end
         end
         if filter === nothing
             break
-        elseif filter(ParsingRow(names, types, flags, rowcode, codes, row, tapes, buf, startpos, pos - startpos))
+        elseif filter(ParsingRow(names, types, flags, rowcode, codes, row, tapes, buf, rowstart, pos - rowstart))
             break
         end
     end
