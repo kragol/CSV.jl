@@ -173,6 +173,7 @@ function File(source;
     threaded::Union{Bool, Nothing}=nothing,
     select=nothing,
     drop=nothing,
+    filter=nothing,
     # parsing options
     missingstrings=String[],
     missingstring="",
@@ -231,14 +232,14 @@ function File(source;
     refs = Vector{RefPool}(undef, ncols)
     if threaded === true
         # multithread
-        finalrows, tapes = multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow - 1, pool, refs, ncols, typemap, h.categorical, customtypes, limit, debug)
+        finalrows, tapes = multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow - 1, pool, refs, ncols, typemap, h.categorical, customtypes, limit, filter, debug)
     else
         if limit < rowsguess
             rowsguess = limit
         end
         tapes = allocate(rowsguess, ncols, types, flags)
         t = Base.time()
-        finalrows, pos = parsetape!(Val(transpose), ncols, typemap, tapes, buf, datapos, len, limit, positions, pool, refs, rowsguess, datarow - 1, types, flags, debug, options, coloptions, customtypes)
+        finalrows, pos = parsetape!(Val(transpose), ncols, typemap, tapes, buf, datapos, len, limit, positions, pool, refs, rowsguess, datarow - 1, types, flags, filter, debug, options, coloptions, customtypes)
         debug && println("time for initial parsing to tape: $(Base.time() - t)")
         for i = 1:ncols
             tape = tapes[i]
@@ -374,7 +375,7 @@ function promotetostring!(tapes, poslens, flags, col, rows, fullrows, options, b
     return
 end
 
-function multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow, pool, refs, ncols, typemap, categorical, customtypes, limit, debug)
+function multithreadparse(types, flags, buf, datapos, len, options, coloptions, rowsguess, datarow, pool, refs, ncols, typemap, categorical, customtypes, limit, filter, debug)
     N = Threads.nthreads()
     if limit < rowsguess
         newlen = [0, ceil(Int64, (limit / (rowsguess * 0.8)) * len), 0]
@@ -401,7 +402,7 @@ function multithreadparse(types, flags, buf, datapos, len, options, coloptions, 
         tl_types = copy(types)
         tl_tapes = allocate(rowchunkguess, ncols, tl_types, tl_flags)
         perthreadtapes[i] = tl_tapes
-        tl_rows, tl_pos = parsetape!(Val(false), ncols, typemap, tl_tapes, buf, tl_pos, tl_len, typemax(Int64), EMPTY_INT_ARRAY, pool, tl_refs, rowchunkguess, datarow + (rowchunkguess * (i - 1)), tl_types, tl_flags, debug, options, coloptions, customtypes)
+        tl_rows, tl_pos = parsetape!(Val(false), ncols, typemap, tl_tapes, buf, tl_pos, tl_len, typemax(Int64), EMPTY_INT_ARRAY, pool, tl_refs, rowchunkguess, datarow + (rowchunkguess * (i - 1)), tl_types, tl_flags, filter, debug, options, coloptions, customtypes)
         rows[i] = tl_rows
         # promote column types across threads
         for col = 1:ncols
@@ -488,13 +489,13 @@ function multithreadparse(types, flags, buf, datapos, len, options, coloptions, 
     return limit < finalrows ? limit : finalrows, finaltapes
 end
 
-function parsetape!(TR::Val{transpose}, ncols, typemap, tapes, buf, pos, len, limit, positions, pool, refs, rowsguess, rowoffset, types, flags, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
+function parsetape!(TR::Val{transpose}, ncols, typemap, tapes, buf, pos, len, limit, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
     row = 0
     startpos = pos
     if pos <= len && len > 0
         while row < limit
             row += 1
-            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, debug, options, coloptions, customtypes)
+            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, debug, options, coloptions, customtypes)
             (pos > len || row == limit) && break
             # if our initial row estimate was too few, we need to reallocate our tapes/poslens to read the rest of the file
             if row + 1 > rowsguess
@@ -533,7 +534,7 @@ end
     if pos <= len && len > 0
         while row < limit
             row += 1
-            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, debug, options, coloptions, customtypes)
+            pos = parserow(row, TR, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, nothing, debug, options, coloptions, customtypes)
             pos > len && break
         end
     end
@@ -574,69 +575,139 @@ end
     end
 end
 
-@inline function parserow(row, TR::Val{transpose}, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
-    for col = 1:ncols
-        if transpose
-            @inbounds pos = positions[col]
-        end
-        @inbounds flag = flags[col]
-        @inbounds tape = tapes[col]
-        @inbounds opts = coloptions === nothing ? options : coloptions[col]
-        # @show typeof(tape)
-        if willdrop(flag) || (user(flag) && tape isa MissingVector)
-            pos, code = parsemissing!(buf, pos, len, opts, row, rowoffset, col)
-        elseif !typedetected(flag)
-            pos, code = detect(tapes, buf, pos, len, opts, row, rowoffset, col, typemap, pool, refs, debug, types, flags, rowsguess)
-        elseif tape isa SVec{Int64}
-            pos, code = parseint!(flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa SVec{Float64}
-            pos, code = parsevalue!(Float64, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa SVec2{String}
-            pos, code = parsestring2!(flag, tape, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa SVec{Date}
-            pos, code = parsevalue!(Date, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa SVec{DateTime}
-            pos, code = parsevalue!(DateTime, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa SVec{Time}
-            pos, code = parsevalue!(Time, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa Vector{Union{Missing, Bool}}
-            pos, code = parsevalue!(Bool, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif tape isa Vector{UInt32}
-            pos, code = parsepooled!(flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, rowsguess, pool, refs, types, flags)
-        elseif tape isa Vector{PosLen}
-            pos, code = parsestring!(flag, tape, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        elseif customtypes !== Tuple{}
-            pos, code = parsecustom!(customtypes, flag, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
-        else
-            error("bad array type: $(typeof(tape))")
-        end
-        if promote_to_string(code)
-            # debug && println("promoting col = $col to string")
-            promotetostring!(col, TR, ncols, typemap, tapes, buf, startpos, len, row, positions, pool, refs, rowsguess, rowoffset, types, flags, debug, options, coloptions, customtypes)
-        end
-        if transpose
-            @inbounds positions[col] = pos
-        else
-            if col < ncols
-                if Parsers.newline(code) || pos > len
-                    options.silencewarnings || notenoughcolumns(col, ncols, rowoffset + row)
-                    for j = (col + 1):ncols
-                        @inbounds flags[j] |= ANYMISSING
-                        @inbounds types[j] = Union{Missing, types[j]}
-                    end
-                    break # from for col = 1:ncols
-                end
+@inline function parserow(row, TR::Val{transpose}, ncols, typemap, tapes, startpos, buf, pos, len, positions, pool, refs, rowsguess, rowoffset, types, flags, filter, debug, options::Parsers.Options{ignorerepeated}, coloptions, ::Type{customtypes}) where {transpose, ignorerepeated, customtypes}
+    while pos <= len
+        startpos = pos
+        rowcode = None
+        for col = 1:ncols
+            if transpose
+                @inbounds pos = positions[col]
+            end
+            @inbounds flag = flags[col]
+            @inbounds tape = tapes[col]
+            @inbounds opts = coloptions === nothing ? options : coloptions[col]
+            # @show typeof(tape)
+            if willdrop(flag) || (user(flag) && tape isa MissingVector)
+                pos, code = parsemissing!(buf, pos, len, opts, row, rowoffset, col)
+            elseif !typedetected(flag)
+                pos, code = detect(tapes, buf, pos, len, opts, row, rowoffset, col, typemap, pool, refs, debug, types, flags, rowsguess)
+            elseif tape isa SVec{Int64}
+                pos, code = parseint!(flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa SVec{Float64}
+                pos, code = parsevalue!(Float64, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa SVec2{String}
+                pos, code = parsestring2!(flag, tape, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa SVec{Date}
+                pos, code = parsevalue!(Date, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa SVec{DateTime}
+                pos, code = parsevalue!(DateTime, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa SVec{Time}
+                pos, code = parsevalue!(Time, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa Vector{Union{Missing, Bool}}
+                pos, code = parsevalue!(Bool, flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif tape isa Vector{UInt32}
+                pos, code = parsepooled!(flag, tape, tapes, buf, pos, len, opts, row, rowoffset, col, rowsguess, pool, refs, types, flags)
+            elseif tape isa Vector{PosLen}
+                pos, code = parsestring!(flag, tape, buf, pos, len, opts, row, rowoffset, col, types, flags)
+            elseif customtypes !== Tuple{}
+                pos, code = parsecustom!(customtypes, flag, tapes, buf, pos, len, opts, row, rowoffset, col, types, flags)
             else
-                if pos <= len && !Parsers.newline(code)
-                    options.silencewarnings || toomanycolumns(ncols, rowoffset + row)
-                    # ignore the rest of the line
-                    pos = skiptorow(buf, pos, len, options.oq, options.e, options.cq, 1, 2)
+                error("bad array type: $(typeof(tape))")
+            end
+            if promote_to_string(code)
+                # debug && println("promoting col = $col to string")
+                promotetostring!(col, TR, ncols, typemap, tapes, buf, startpos, len, row, positions, pool, refs, rowsguess, rowoffset, types, flags, debug, options, coloptions, customtypes)
+            end
+            if filter !== nothing
+                @inbounds codes[col] = code
+            end
+            if transpose
+                @inbounds positions[col] = pos
+            else
+                if col < ncols
+                    if Parsers.newline(code) || pos > len
+                        options.silencewarnings || notenoughcolumns(col, ncols, rowoffset + row)
+                        for j = (col + 1):ncols
+                            @inbounds flags[j] |= ANYMISSING
+                            @inbounds types[j] = Union{Missing, types[j]}
+                        end
+                        break # from for col = 1:ncols
+                    end
+            else
+                if col < ncols
+                    if Parsers.newline(code) || pos > len
+                        rowcode = NotEnoughColumns
+                        options.silencewarnings || notenoughcolumns(col, ncols, rowoffset + row)
+                        for j = (col + 1):ncols
+                            @inbounds flags[j] |= ANYMISSING
+                            @inbounds types[j] = Union{Missing, types[j]}
+                        end
+                        break # from for col = 1:ncols
+                    end
+                else
+                    if pos <= len && !Parsers.newline(code)
+                        rowcode = TooManyColumns
+                        options.silencewarnings || toomanycolumns(ncols, rowoffset + row)
+                        # ignore the rest of the line
+                        pos = skiptorow(buf, pos, len, options.oq, options.e, options.cq, 1, 2)
+                    end
                 end
             end
+        end
+        if filter === nothing
+            break
+        elseif filter(ParsingRow(names, types, flags, rowcode, codes, row, tapes, buf, startpos, pos - startpos))
+            break
         end
     end
     return pos
 end
+
+struct ParsingRow <: Tables.AbstractRow
+    names::Vector{Symbol}
+    types::Vector{Type}
+    flags::Vector{UInt8}
+    code::RowErrorCode
+    codes::Vector{Int16}
+    row::Int64
+    columns::Vector{AbstractVector}
+    buf::AbstractVector{UInt8}
+    pos::Int64 # starting byte position of row
+    len::Int64 # # of bytes in row
+end
+
+getnames(r::ParsingRow) = getfield(r, :names)
+getcolumn(r::ParsingRow, col::Int) = getfield(r, :columns)[col]
+getcolumn(r::ParsingRow, col::Symbol) = getfield(r, :columns)[findfirst(==(col), getnames(r))]
+gettypes(r::ParsingRow) = getfield(r, :types)
+getflags(r::ParsingRow) = getfield(r, :flags)
+getcode(r::ParsingRow) = getfield(r, :code)
+getcodes(r::ParsingRow) = getfield(r, :codes)
+getrow(r::ParsingRow) = getfield(r, :row)
+getbuf(r::ParsingRow) = getfield(r, :buf)
+getpos(r::ParsingRow) = getfield(r, :pos)
+getlen(r::ParsingRow) = getfield(r, :len)
+
+Tables.columnnames(r::ParsingRow) = getnames(r)
+
+@inline function Tables.getcolumn(row::ParsingRow, ::Type{T}, i::Int, nm::Symbol) where {T}
+    column = getcolumn(row, i)
+    @inbounds x = column[getrow(row)]
+    return x
+end
+
+@inline function Tables.getcolumn(row::ParsingRow, col::Symbol)
+    column = getcolumn(row, col)
+    @inbounds x = column[getrow(row)]
+    return x
+end
+
+@inline function Tables.getcolumn(row::ParsingRow, col::Int)
+    column = getcolumn(row, col)
+    @inbounds x = column[getrow(row)]
+    return x
+end
+
 
 @inline function poslen(code, pos, len)
     pos = Core.bitcast(UInt64, pos) << 20
